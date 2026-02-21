@@ -440,6 +440,198 @@ git pull
 ```
 
 ---
+---
+
+# 🆕 Дополнительные SEO-фиксы (февраль 2026)
+
+## 🧹 Причина работ
+В Яндекс.Вебмастере появились «странные» URL в обходе с параметрами `token` (и др.), например:
+
+- `/auth/telegram/callback?token=...`
+- `/region/.../category/?token=...`
+
+Цель — убрать дубли и мусор из обхода, снизить нагрузку, сохранить чистый canonical-граф.
+
+---
+
+## 🤖 robots.txt (backend)
+
+### Что сделано
+`robots.txt` обновлён: добавлены запреты на служебные URL и token-параметры.
+
+Текущее содержимое:
+
+```
+User-agent: *
+Allow: /
+
+Disallow: /auth/
+Disallow: /*?token=
+Disallow: /*&token=
+
+Sitemap: https://koptorg.ru/sitemap.xml
+```
+
+Проверка:
+
+```
+curl -s "https://koptorg.ru/robots.txt"
+```
+
+---
+
+## 🌐 Nginx: нормализация query-параметров (301 → чистый URL)
+
+### Token cleanup (основной фикс)
+Любой URL с `?token=...` режется в 301 на чистый путь, кроме callback, где token нужен для логина.
+
+```
+# token=... -> canonical (except /auth/telegram/callback)
+set $strip_token 0;
+if ($arg_token != "") { set $strip_token 1; }
+if ($uri = "/auth/telegram/callback") { set $strip_token 0; }
+if ($strip_token = 1) {
+    return 301 $scheme://$host$uri;
+}
+```
+
+Проверка:
+
+```
+curl -I "https://koptorg.ru/region/nso/product/3255?token=abc"
+```
+
+Ожидаемо: `301 Location: https://koptorg.ru/region/nso/product/3255`
+
+---
+
+### Marketing junk cleanup (utm/gclid/yclid/fbclid)
+Также нормализуются «маркетинговые» параметры (чтобы не плодить дубли):
+
+- `utm_source`, `utm_medium`, `utm_campaign`, `utm_term`, `utm_content`
+- `gclid`, `yclid`, `fbclid`
+
+```
+set $strip_junk 0;
+if ($arg_utm_source   != "") { set $strip_junk 1; }
+if ($arg_utm_medium   != "") { set $strip_junk 1; }
+if ($arg_utm_campaign != "") { set $strip_junk 1; }
+if ($arg_utm_term     != "") { set $strip_junk 1; }
+if ($arg_utm_content  != "") { set $strip_junk 1; }
+if ($arg_gclid        != "") { set $strip_junk 1; }
+if ($arg_yclid        != "") { set $strip_junk 1; }
+if ($arg_fbclid       != "") { set $strip_junk 1; }
+
+if ($strip_junk = 1) {
+    return 301 $scheme://$host$uri;
+}
+```
+
+Проверка:
+
+```
+curl -I "https://koptorg.ru/region/nso/product/3255?utm_source=test"
+curl -I "https://koptorg.ru/region/nso/product/3255?gclid=123"
+curl -I "https://koptorg.ru/region/nso/product/3255?fbclid=abc"
+```
+
+Ожидаемо: везде `301` на чистый URL без параметров.
+
+---
+
+## 🔐 Nginx: защита /auth/* и TG callback
+
+### /auth/ (слэш) → канонический /auth (HTTPS)
+Чтобы не было редиректов на http и лишних вариантов URL:
+
+```
+location = /auth/ {
+    return 301 https://$host/auth;
+}
+```
+
+Проверка:
+
+```
+curl -I "https://koptorg.ru/auth/"
+```
+
+---
+
+### /auth/*: noindex + no-store + мимо prerender
+На уровне nginx:
+
+- `X-Robots-Tag: noindex, nofollow`
+- `Cache-Control: no-store`
+- исключение из prerender (через отдельный `location ^~ /auth/`)
+
+Пример:
+
+```
+location ^~ /auth/ {
+    add_header X-Robots-Tag "noindex, nofollow" always;
+    add_header Cache-Control "no-store" always;
+    proxy_pass $proxy_target_main;
+}
+```
+
+Проверка:
+
+```
+curl -I "https://koptorg.ru/auth/"
+```
+
+---
+
+### /auth/telegram/callback: HEAD → 200 (убран 405 в обходе)
+Проблема: `curl -I` / HEAD давал `405 Allow: GET`.
+
+Решение: отдельный `location` — HEAD отвечает `200`, GET идёт в backend, всё под `noindex`.
+
+```
+location = /auth/telegram/callback {
+    if ($request_method = HEAD) { return 200; }
+
+    add_header X-Robots-Tag "noindex, nofollow" always;
+    add_header Cache-Control "no-store" always;
+
+    proxy_pass $proxy_target_main;
+}
+```
+
+Проверка:
+
+```
+curl -I "https://koptorg.ru/auth/telegram/callback?token=abc"
+curl -X GET -I "https://koptorg.ru/auth/telegram/callback?token=abc"
+```
+
+Ожидаемо: `HEAD -> 200`, `GET -> 200/302/…` (по логике backend), но **не 405**, и всегда `X-Robots-Tag: noindex, nofollow`.
+
+---
+
+## ✅ Prerender: финальная проверка (важно: GET, не HEAD)
+
+Важно: `curl -I` делает HEAD, а HEAD намеренно **не** уходит в prerender (чтобы не повторить инцидент 504/400).
+
+Правильная проверка prerender (GET):
+
+```
+curl -s -o /dev/null -D - -A "Mozilla/5.0 (compatible; YandexBot/3.0; +http://yandex.com/bots)"   "https://koptorg.ru/region/nso/product/3255" | sed -n '1,30p'
+```
+
+Ожидаемо: `X-Prerendered: 1`.
+
+Проверка, что параметры режутся до prerender и для бота:
+
+```
+curl -I -A YandexBot "https://koptorg.ru/region/nso/product/3255?utm_source=test"
+curl -I -A YandexBot "https://koptorg.ru/region/nso/product/3255?token=abc"
+```
+
+Ожидаемо: `301` на чистый URL.
+
+---
 
 # 📊 SEO Готовность
 
@@ -458,8 +650,9 @@ Robots — ✅
 SSL основной домен — ✅  
 HEAD обработка — ✅  
 504 устранены — ✅  
-Инфраструктура стабильна — ✅  
-Schema.org — ❌  
+\1Token/UTM нормализация — ✅  
+Auth (noindex + HEAD fix) — ✅  
+\2  
 
 ---
 
