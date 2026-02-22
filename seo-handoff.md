@@ -682,3 +682,318 @@ SPA + Dynamic Rendering (Prerender)
 Система готова к масштабированию
 ````
 
+
+
+---
+---
+# 🆕 Дополнение (февраль 2026, стабилизация prerender под бурсты ботов)
+
+## 🧩 Симптом
+При включенном prerender для ботов (особенно при параллельных запросах) в логах контейнера `prerender` появлялись:
+
+- `page timed out ... requestsInFlight=5/6/8`
+- иногда после бурста: `Can't connect to Chrome ... port: 9222 (ECONNREFUSED)`
+
+Причина: burst-поток запросов создавал слишком много одновременных страниц в headless Chrome.
+
+---
+
+## ✅ Решение: rate limiting на вход в prerender (Nginx)
+
+### 1) Глобальная зона лимита (в http {})
+Добавлено:
+
+```
+limit_req_zone $binary_remote_addr zone=prerender_zone:10m rate=2r/s;
+```
+
+### 2) Named location для prerender
+В конфиг сайта добавлено:
+
+```
+location @prerender_main {
+    limit_req zone=prerender_zone burst=2;
+
+    proxy_method $upstream_method;
+
+    proxy_connect_timeout 30s;
+    proxy_send_timeout    120s;
+    proxy_read_timeout    120s;
+    send_timeout          120s;
+
+    proxy_pass http://127.0.0.1:3000/render?url=https://koptorg.ru$request_uri;
+
+    proxy_hide_header X-Prerendered;
+    add_header X-Prerendered 1 always;
+}
+```
+
+Ключевое:
+- burst уменьшен до 2
+- параметр nodelay убран (чтобы не пропускать бурст мгновенно)
+
+### 3) Переключение через error_page 418
+В `location /` используется безопасный переход:
+
+```
+error_page 418 = @prerender_main;
+if ($do_prerender_main = 1) { return 418; }
+```
+
+---
+
+## ✅ Результат
+После внедрения:
+
+- burst‑нагрузка больше не валит prerender
+- свежие логи не показывают массовых `timed out`
+- Chrome перестал падать на 9222
+- система стабильна под параллельными запросами
+
+---
+
+## 🤖 Текущая стратегия ботов
+
+Рекомендовано держать prerender только для:
+
+```
+(yandexbot|googlebot)
+```
+
+Файл управления:
+
+```
+/etc/nginx/conf.d/prerender_maps_koptorg.conf
+```
+
+---
+
+## 🐳 Управление контейнером prerender
+
+На сервере используется docker-compose v1:
+
+```
+cd /opt/prerender
+docker-compose up -d
+docker-compose down --remove-orphans
+docker-compose ps
+```
+
+Команда `docker compose` (v2) отсутствует.
+
+---
+
+## 📌 Итог
+
+Prerender стабилизирован под реальную бот‑нагрузку.  
+Инфраструктура готова к безопасной индексации Google и Яндекса.
+
+
+---
+---
+
+# 🆕 ДОПОЛНЕНИЕ v4 — КЭШ PRERENDER И СТАБИЛИЗАЦИЯ (февраль 2026)
+
+## 🚀 Включён proxy_cache для prerender
+
+В nginx добавлен полноценный cache‑слой перед prerender.
+
+### В http {}
+
+```
+proxy_cache_path /var/cache/nginx/prerender
+  levels=1:2
+  keys_zone=prerender_cache:50m
+  max_size=2g
+  inactive=1d
+  use_temp_path=off;
+```
+
+Эффект:
+
+- первый бот → MISS (рендер Chrome)
+- повторные боты → HIT (из nginx RAM/disk)
+- резкое снижение нагрузки на Chrome
+
+---
+
+## ⚙️ Кэш внутри @prerender_main
+
+```
+proxy_cache prerender_cache;
+proxy_cache_key "$scheme://$host$request_uri";
+proxy_cache_valid 200 30m;
+proxy_cache_valid 301 302 1m;
+proxy_cache_use_stale updating error timeout http_500 http_502 http_503 http_504;
+
+proxy_cache_lock on;
+proxy_cache_lock_timeout 30s;
+proxy_cache_lock_age 30s;
+
+add_header X-Prerender-Cache $upstream_cache_status always;
+```
+
+### Что это дало
+
+- устранены burst‑шторма по Chrome
+- первый рендер ~3–4s
+- повторные запросы ~0.2–1.3s
+- Chrome перестал перегреваться
+
+---
+
+## 🤖 Расширена детекция ботов
+
+Файл:
+
+```
+/etc/nginx/conf.d/prerender_maps_koptorg.conf
+```
+
+Теперь:
+
+```
+map $http_user_agent $is_bot_main {
+    default 0;
+    ~*(yandexbot|googlebot) 1;
+}
+```
+
+### Проверка Googlebot
+
+```
+curl -A "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)"   https://koptorg.ru/region/nso/category/polufabrikaty/vareniki
+```
+
+Ожидаемо:
+
+```
+X-Prerendered: 1
+```
+
+---
+
+## 🐳 Стабилизация docker prerender
+
+### Текущие параметры контейнера
+
+Рекомендовано для сервера ~2GB RAM:
+
+- shm_size: 512m
+- mem_limit: 1g
+- cpus: 1.0
+
+### Важно
+
+Если увеличен shm_size — **НЕ использовать**:
+
+```
+--disable-dev-shm-usage
+```
+
+Он отключает использование shm Chrome.
+
+---
+
+## 🧯 Инцидент docker-compose ContainerConfig
+
+### Симптом
+
+```
+KeyError: 'ContainerConfig'
+```
+
+при `docker-compose up -d`
+
+### Причина
+
+Баг docker‑compose v1 при recreate контейнера.
+
+### Быстрое восстановление (проверено)
+
+```
+cd /opt/prerender
+docker-compose down --remove-orphans
+docker rm -f prerender || true
+docker-compose up -d
+```
+
+После этого контейнер успешно поднялся.
+
+---
+
+# 🧪 ШПАРГАЛКИ ОПЕРАЦИОННЫЕ
+
+## 🔍 Проверка prerender напрямую
+
+```
+curl -s -o /dev/null -w "%{http_code}\n"   "http://127.0.0.1:3000/render?url=https://koptorg.ru/region/nso"
+```
+
+Ожидаемо: 200
+
+---
+
+## 🔍 Проверка через nginx (бот)
+
+```
+curl -s -D - -o /dev/null -A YandexBot   "https://koptorg.ru/region/nso/category/polufabrikaty/vareniki"   | egrep -i "x-prerendered|x-prerender-cache"
+```
+
+Ожидаемо:
+
+- MISS при первом заходе
+- HIT при повторе
+
+---
+
+## 🔍 Проверка Googlebot
+
+```
+curl -s -D - -o /dev/null   -A "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)"   "https://koptorg.ru/region/nso/category/polufabrikaty/vareniki"
+```
+
+---
+
+## 📊 Проверка логов Chrome
+
+```
+docker logs --since "10m" prerender   | egrep -i "Restarting Chrome|connection closed|timed out"
+```
+
+Норма: пусто или единичные строки.
+
+---
+
+## ⚡ Быстрый тест нагрузки
+
+```
+time bash -lc 'for i in {1..8}; do   curl -s -o /dev/null -A "YandexBot"   "https://koptorg.ru/region/nso/category/polufabrikaty/vareniki" &
+done; wait'
+```
+
+Норма после кеша: ~1–2 секунды.
+
+---
+
+# 🟢 АКТУАЛЬНЫЙ СТАТУС (конец февраля 2026)
+
+- prerender работает стабильно
+- nginx cache активен
+- burst защита включена
+- Googlebot подключён
+- Chrome без массовых рестартов
+- инфраструктура выдерживает параллельных ботов
+
+---
+
+# 🏁 Уровень готовности
+
+**Production‑ready SPA SEO infrastructure**
+
+Система готова к:
+
+- активному обходу Яндекс
+- подключению Google Search Console
+- масштабированию трафика
+
